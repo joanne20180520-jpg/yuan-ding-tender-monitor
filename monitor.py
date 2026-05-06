@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-monitor.py v5 — Playwright 版（正確網址）
+monitor.py v6 — Playwright 版（正確抓取列表欄位）
 元頂國際控股集團 — 政府標案即時監控系統
 """
 
@@ -35,7 +35,6 @@ async def search_tenders(keyword: str, page) -> list[dict]:
         today     = date.today().strftime("%Y/%m/%d")
         yesterday = (date.today() - timedelta(days=1)).strftime("%Y/%m/%d")
 
-        # 用正確的搜尋網址，直接帶入關鍵字和日期
         url = (
             f"https://web.pcc.gov.tw/prkms/tender/common/basic/readTenderBasic"
             f"?firstSearch=true&searchType=basic&isBinding=N&isLogIn=N"
@@ -50,27 +49,43 @@ async def search_tenders(keyword: str, page) -> list[dict]:
         await page.goto(url, wait_until="networkidle", timeout=30000)
         await page.wait_for_timeout(2000)
 
-        # 抓所有標案列
-        rows = await page.query_selector_all("tr.tender-row, table.tb_tnd tr, tbody tr")
+        # 抓所有表格列
+        rows = await page.query_selector_all("tbody tr")
 
         for row in rows:
             try:
-                link = await row.query_selector("a")
+                cells = await row.query_selector_all("td")
+                if len(cells) < 7:
+                    continue
+
+                # 欄位順序：機關名稱 | 標案案號/標案名稱 | 傳輸次數 | 招標方式 | 採購性質 | 公告日期 | 截止投標 | 預算金額
+                unit     = (await cells[0].inner_text()).strip()
+                
+                # 第二欄包含案號和標案名稱，抓連結
+                link     = await cells[1].query_selector("a")
                 if not link:
                     continue
-                title = (await link.inner_text()).strip()
-                href  = await link.get_attribute("href") or ""
+                title    = (await link.inner_text()).strip()
+                href     = await link.get_attribute("href") or ""
                 if href and not href.startswith("http"):
                     href = "https://web.pcc.gov.tw" + href
-                cells = await row.query_selector_all("td")
-                unit  = (await cells[0].inner_text()).strip() if cells else "—"
+
+                # 截止日期（倒數第二欄）
+                deadline = (await cells[-2].inner_text()).strip()
+                # 預算金額（最後一欄，排除「檢視」按鈕欄）
+                budget   = (await cells[-1].inner_text()).strip()
+                # 去掉「檢視」按鈕的文字
+                if "檢視" in budget:
+                    budget = (await cells[-2].inner_text()).strip()
+                    deadline = (await cells[-3].inner_text()).strip()
+
                 if title and len(title) > 5:
                     tenders.append({
                         "id":       href.split("pkPmsMain=")[-1] if "pkPmsMain=" in href else title[:20],
                         "title":    title,
                         "unit":     unit,
-                        "budget":   "—",
-                        "deadline": "—",
+                        "budget":   budget + " 元" if budget and budget != "—" else "—",
+                        "deadline": deadline,
                         "url":      href or url,
                     })
             except:
@@ -156,8 +171,8 @@ def build_email_html(matches):
             <strong><a href="{url}" style="color:#1a73e8;text-decoration:none;">{title}</a></strong><br>
             <span style="color:#666;font-size:13px;">🏢 {unit}</span>
           </td>
-          <td style="padding:12px;border-bottom:1px solid #eee;color:#444;">{budget}</td>
-          <td style="padding:12px;border-bottom:1px solid #eee;color:#444;">{deadline}</td>
+          <td style="padding:12px;border-bottom:1px solid #eee;color:#444;white-space:nowrap;">{budget}</td>
+          <td style="padding:12px;border-bottom:1px solid #eee;color:#444;white-space:nowrap;">{deadline}</td>
           <td style="padding:12px;border-bottom:1px solid #eee;">
             <span style="background:#e8f0fe;color:#1a73e8;padding:3px 8px;border-radius:12px;font-size:12px;">{groups}</span><br>
             <span style="color:#888;font-size:12px;margin-top:4px;display:block;">關鍵字：{keywords}</span>
@@ -174,7 +189,7 @@ def build_email_html(matches):
         <thead style="background:#f8f9fa;"><tr>
           <th style="padding:12px;text-align:left;font-size:13px;color:#666;">標案名稱 / 機關</th>
           <th style="padding:12px;text-align:left;font-size:13px;color:#666;">預算金額</th>
-          <th style="padding:12px;text-align:left;font-size:13px;color:#666;">截止日期</th>
+          <th style="padding:12px;text-align:left;font-size:13px;color:#666;">截止投標</th>
           <th style="padding:12px;text-align:left;font-size:13px;color:#666;">業務線 / 關鍵字</th>
         </tr></thead>
         <tbody>{rows}</tbody>
