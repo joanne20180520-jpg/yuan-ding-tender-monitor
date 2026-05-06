@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
-monitor.py v4 — Playwright 版
+monitor.py v5 — Playwright 版（正確網址）
 元頂國際控股集團 — 政府標案即時監控系統
-
-使用真實 Chrome 瀏覽器爬取政府電子採購網，繞過反爬蟲機制。
-執行方式：由 GitHub Actions 每 5 分鐘自動觸發
 """
 
 import os
@@ -23,8 +20,6 @@ NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", "")
 GMAIL_USER   = os.environ.get("GMAIL_USER", "")
 GMAIL_PASS   = os.environ.get("GMAIL_PASS", "")
 
-PCC_SEARCH_URL = "https://web.pcc.gov.tw/tps/pss/tender.do?method=search&searchMode=common"
-
 SEARCH_KEYWORDS = [
     "室內裝修", "裝潢", "展館設計", "裝潢施工",
     "整合行銷", "品牌設計", "形象展",
@@ -37,24 +32,27 @@ SEARCH_KEYWORDS = [
 async def search_tenders(keyword: str, page) -> list[dict]:
     tenders = []
     try:
-        await page.goto(PCC_SEARCH_URL, wait_until="networkidle", timeout=30000)
-        await page.wait_for_timeout(1000)
-        await page.fill('input[name="tenderName"]', keyword)
-
         today     = date.today().strftime("%Y/%m/%d")
         yesterday = (date.today() - timedelta(days=1)).strftime("%Y/%m/%d")
 
-        try:
-            await page.fill('input[name="tenderStartDate"]', yesterday)
-            await page.fill('input[name="tenderEndDate"]', today)
-        except:
-            pass
+        # 用正確的搜尋網址，直接帶入關鍵字和日期
+        url = (
+            f"https://web.pcc.gov.tw/prkms/tender/common/basic/readTenderBasic"
+            f"?firstSearch=true&searchType=basic&isBinding=N&isLogIn=N"
+            f"&tenderName={keyword}"
+            f"&tenderType=TENDER_DECLARATION"
+            f"&tenderWay=TENDER_WAY_ALL_DECLARATION"
+            f"&dateType=isSpdt"
+            f"&tenderStartDate={yesterday.replace('/', '%2F')}"
+            f"&tenderEndDate={today.replace('/', '%2F')}"
+        )
 
-        await page.click('input[type="submit"], button:has-text("搜尋")')
-        await page.wait_for_load_state("networkidle", timeout=20000)
-        await page.wait_for_timeout(1500)
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+        await page.wait_for_timeout(2000)
 
-        rows = await page.query_selector_all("table tr")
+        # 抓所有標案列
+        rows = await page.query_selector_all("tr.tender-row, table.tb_tnd tr, tbody tr")
+
         for row in rows:
             try:
                 link = await row.query_selector("a")
@@ -73,20 +71,23 @@ async def search_tenders(keyword: str, page) -> list[dict]:
                         "unit":     unit,
                         "budget":   "—",
                         "deadline": "—",
-                        "url":      href or PCC_SEARCH_URL,
+                        "url":      href or url,
                     })
             except:
                 continue
 
         print(f"[INFO] 關鍵字「{keyword}」找到 {len(tenders)} 筆")
+
     except Exception as e:
         print(f"[WARN] 搜尋「{keyword}」失敗：{e}")
+
     return tenders
 
 
 async def fetch_all_tenders() -> list[dict]:
     all_tenders = []
     seen_ids    = set()
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(
             headless=True,
@@ -97,6 +98,7 @@ async def fetch_all_tenders() -> list[dict]:
             locale="zh-TW",
         )
         page = await context.new_page()
+
         for kw in SEARCH_KEYWORDS:
             results = await search_tenders(kw, page)
             for t in results:
@@ -104,7 +106,9 @@ async def fetch_all_tenders() -> list[dict]:
                     seen_ids.add(t["id"])
                     all_tenders.append(t)
             await asyncio.sleep(1)
+
         await browser.close()
+
     print(f"[INFO] 共取得 {len(all_tenders)} 筆不重複標案")
     return all_tenders
 
@@ -159,6 +163,7 @@ def build_email_html(matches):
             <span style="color:#888;font-size:12px;margin-top:4px;display:block;">關鍵字：{keywords}</span>
           </td>
         </tr>"""
+
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     return f"""<html><body style="font-family:Arial,sans-serif;color:#333;max-width:900px;margin:auto;">
       <div style="background:#1a73e8;color:white;padding:20px 24px;border-radius:8px 8px 0 0;">
