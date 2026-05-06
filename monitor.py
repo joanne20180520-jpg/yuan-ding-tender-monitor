@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-monitor.py v2
+monitor.py v3
 元頂國際控股集團 — 政府標案即時監控系統
 
-資料來源：政府電子採購網 XML 開放資料
+資料來源：政府電子採購網搜尋頁面（requests + BeautifulSoup）
 執行方式：由 GitHub Actions 每 5 分鐘自動觸發
 """
 
 import os
 import json
+import re
 import smtplib
 import requests
-import xml.etree.ElementTree as ET
 from datetime import datetime, date, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -23,106 +23,98 @@ SEEN_FILE    = "seen_tenders.json"
 NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", "")
 GMAIL_USER   = os.environ.get("GMAIL_USER", "")
 GMAIL_PASS   = os.environ.get("GMAIL_PASS", "")
-
-# 政府電子採購網 開放資料 XML endpoint
-PCC_XML_URL  = "https://web.pcc.gov.tw/tps/tp/OpenData/exportXML"
 # ────────────────────────────────────────────────────────
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9",
+}
 
-def fetch_tenders() -> list[dict]:
-    """抓取政府電子採購網最新招標公告（XML 開放資料）"""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; TenderMonitor/2.0)",
-        "Accept": "application/xml, text/xml, */*",
+
+def fetch_tenders_by_keyword(keyword: str) -> list[dict]:
+    """對政府電子採購網搜尋指定關鍵字，回傳標案清單"""
+    tenders = []
+    today = date.today()
+    date_str = today.strftime("%Y/%m/%d")
+    yesterday_str = (today - timedelta(days=1)).strftime("%Y/%m/%d")
+
+    url = "https://web.pcc.gov.tw/tps/pss/tender.do"
+    params = {
+        "method": "search",
+        "searchMode": "common",
+        "tenderName": keyword,
+        "dateType": "isDate",
+        "tenderStartDate": yesterday_str,
+        "tenderEndDate": date_str,
+        "tenderStatus": "4",  # 招標中
     }
-    
-    # 抓今天和昨天的資料
-    tenders = []
-    for days_ago in [0, 1]:
-        target = date.today() - timedelta(days=days_ago)
-        date_str = target.strftime("%Y%m%d")
-        
-        params = {
-            "tenderType": "TENDER_DECLARATION",  # 招標公告
-            "dateType": "isDate",
-            "tenderStartDate": date_str,
-            "tenderEndDate": date_str,
-        }
-        
-        try:
-            resp = requests.get(PCC_XML_URL, params=params, headers=headers, timeout=20)
-            resp.raise_for_status()
-            root = ET.fromstring(resp.content)
-            
-            for item in root.findall(".//tender"):
-                tender = {
-                    "id": item.findtext("tenderSystemId", ""),
-                    "title": item.findtext("tenderName", ""),
-                    "unit": item.findtext("orgName", ""),
-                    "budget": item.findtext("budget", "—"),
-                    "deadline": item.findtext("tenderDeadline", "—"),
-                    "url": item.findtext("pkAtmMain", ""),
-                }
-                tenders.append(tender)
-                
-            print(f"[INFO] {target.strftime('%Y/%m/%d')} 取得 {len(root.findall('.//tender'))} 筆")
-            
-        except Exception as e:
-            print(f"[ERROR] 抓取 {target} 失敗：{e}")
-            # fallback: 用搜尋頁面方式
-            tenders.extend(fetch_by_search(date_str))
-    
+
+    try:
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=20)
+        resp.encoding = "UTF-8"
+        content = resp.text
+
+        # 用 regex 從 HTML 抓標案資訊
+        # 抓標案名稱和連結
+        pattern = r'pkAtmMain=([A-Z0-9_]+)[^"]*"[^>]*>([^<]+)</a>'
+        found = re.findall(pattern, content)
+
+        # 抓機關名稱
+        unit_pattern = r'<td[^>]*class="[^"]*"[^>]*>\s*([^\s<][^<]{2,30})\s*</td>'
+        units = re.findall(unit_pattern, content)
+
+        for i, (pk, title) in enumerate(found[:10]):
+            title = title.strip()
+            if len(title) < 3:
+                continue
+            tenders.append({
+                "id": pk,
+                "title": title,
+                "unit": units[i] if i < len(units) else "—",
+                "budget": "—",
+                "deadline": "—",
+                "url": f"https://web.pcc.gov.tw/tps/pss/tender.do?method=detail&pkAtmMain={pk}",
+            })
+
+    except Exception as e:
+        print(f"[WARN] 搜尋「{keyword}」失敗：{e}")
+
     return tenders
 
 
-def fetch_by_search(date_str: str) -> list[dict]:
-    """備用方案：直接對每個關鍵字搜尋"""
-    tenders = []
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; TenderMonitor/2.0)"}
-    
-    # 只搜尋幾個代表性關鍵字避免太多請求
-    sample_keywords = ["室內設計", "整合行銷", "空調工程", "食品推廣", "營造工程"]
-    
+def fetch_all_tenders() -> list[dict]:
+    """用代表性關鍵字搜尋，蒐集今日標案"""
+    # 每個業務線挑 2 個代表性關鍵字搜尋，避免太多請求
+    sample_keywords = [
+        "室內裝修", "商業空間",
+        "整合行銷", "品牌設計",
+        "空調工程", "冷氣工程",
+        "食品推廣", "農產品推廣",
+        "營造工程", "修繕工程",
+    ]
+
+    all_tenders = []
+    seen_ids = set()
+
     for kw in sample_keywords:
-        try:
-            url = "https://web.pcc.gov.tw/tps/pss/tender.do"
-            params = {
-                "method": "search",
-                "searchMode": "common",
-                "tenderName": kw,
-                "dateType": "isDate",
-                "tenderStartDate": f"{date_str[:4]}/{date_str[4:6]}/{date_str[6:]}",
-            }
-            resp = requests.get(url, params=params, headers=headers, timeout=15)
-            # 簡單解析回傳的標案 ID
-            content = resp.text
-            import re
-            ids = re.findall(r'pkAtmMain=([A-Z0-9]+)', content)
-            titles = re.findall(r'tenderName=([^&"]+)', content)
-            
-            for i, tid in enumerate(ids[:5]):
-                tenders.append({
-                    "id": tid,
-                    "title": titles[i] if i < len(titles) else kw + "相關標案",
-                    "unit": "—",
-                    "budget": "—",
-                    "deadline": "—",
-                    "url": f"https://web.pcc.gov.tw/tps/pss/tender.do?method=detail&pkAtmMain={tid}",
-                })
-        except Exception as e:
-            print(f"[WARN] 搜尋關鍵字 {kw} 失敗：{e}")
-    
-    return tenders
+        results = fetch_tenders_by_keyword(kw)
+        for t in results:
+            if t["id"] not in seen_ids:
+                seen_ids.add(t["id"])
+                all_tenders.append(t)
+        print(f"[INFO] 關鍵字「{kw}」找到 {len(results)} 筆")
+
+    print(f"[INFO] 共取得 {len(all_tenders)} 筆不重複標案")
+    return all_tenders
 
 
 def match_keywords(tender: dict) -> list[str]:
-    """比對標案名稱與機關名稱，回傳命中的關鍵字清單"""
     text = tender.get("title", "") + " " + tender.get("unit", "")
     return [kw for kw in ALL_KEYWORDS if kw in text]
 
 
 def classify_hits(hits: list[str]) -> dict:
-    """將命中關鍵字對應回業務線"""
     result = {}
     for group_name, kws in KEYWORD_GROUPS.items():
         matched = [kw for kw in hits if kw in kws]
@@ -154,9 +146,6 @@ def build_email_html(matches: list[dict]) -> str:
         url      = t.get("url", "#")
         groups   = "、".join(item["classified"].keys()) if item["classified"] else "其他"
         keywords = "、".join(item["hits"])
-
-        if url and not url.startswith("http"):
-            url = f"https://web.pcc.gov.tw/tps/pss/tender.do?method=detail&pkAtmMain={url}"
 
         rows += f"""
         <tr>
@@ -219,14 +208,13 @@ def send_email(subject: str, html_body: str):
 
 
 def run():
-    tenders = fetch_tenders()
-    print(f"[INFO] 共取得 {len(tenders)} 筆標案，開始比對關鍵字")
+    tenders = fetch_all_tenders()
 
     seen    = load_seen()
     matches = []
 
     for tender in tenders:
-        tid = tender.get("id", "") or tender.get("title", "")
+        tid = tender.get("id", "")
         if not tid or tid in seen:
             continue
 
