@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-monitor.py v6 — Playwright 版（正確抓取列表欄位）
+monitor.py v7 — Playwright 版（合併 v5 抓取 + v6 欄位解析）
 元頂國際控股集團 — 政府標案即時監控系統
 """
 
@@ -49,42 +49,67 @@ async def search_tenders(keyword: str, page) -> list[dict]:
         await page.goto(url, wait_until="networkidle", timeout=30000)
         await page.wait_for_timeout(2000)
 
-        # 抓所有表格列
-        rows = await page.query_selector_all("tbody tr")
+        # 用 v5 的方式抓所有 tr（不限定 tbody）
+        rows = await page.query_selector_all("table tr")
 
         for row in rows:
             try:
-                cells = await row.query_selector_all("td")
-                if len(cells) < 7:
-                    continue
-
-                # 欄位順序：機關名稱 | 標案案號/標案名稱 | 傳輸次數 | 招標方式 | 採購性質 | 公告日期 | 截止投標 | 預算金額
-                unit     = (await cells[0].inner_text()).strip()
-                
-                # 第二欄包含案號和標案名稱，抓連結
-                link     = await cells[1].query_selector("a")
+                # 抓連結（標案名稱）
+                link = await row.query_selector("a")
                 if not link:
                     continue
-                title    = (await link.inner_text()).strip()
-                href     = await link.get_attribute("href") or ""
+                title = (await link.inner_text()).strip()
+                href  = await link.get_attribute("href") or ""
                 if href and not href.startswith("http"):
                     href = "https://web.pcc.gov.tw" + href
 
-                # 截止日期（倒數第二欄）
-                deadline = (await cells[-2].inner_text()).strip()
-                # 預算金額（最後一欄，排除「檢視」按鈕欄）
-                budget   = (await cells[-1].inner_text()).strip()
-                # 去掉「檢視」按鈕的文字
-                if "檢視" in budget:
-                    budget = (await cells[-2].inner_text()).strip()
-                    deadline = (await cells[-3].inner_text()).strip()
+                # 抓所有 td
+                cells = await row.query_selector_all("td")
+                if len(cells) < 3:
+                    continue
 
-                if title and len(title) > 5:
+                # 機關名稱（第一欄）
+                unit = (await cells[0].inner_text()).strip()
+
+                # 從所有欄位的文字找日期和金額
+                all_text = [(await c.inner_text()).strip() for c in cells]
+
+                # 找截止日期（格式像 115/05/13）
+                import re
+                deadline = "—"
+                budget   = "—"
+                for text in all_text:
+                    if re.match(r'\d{3}/\d{2}/\d{2}', text) and deadline == "—":
+                        # 跳過公告日期（找第二個日期格式）
+                        if deadline != "—":
+                            deadline = text
+                        else:
+                            # 先存起來，後面的才是截止日
+                            deadline = text
+
+                # 找金額（純數字且大於 10000）
+                for text in reversed(all_text):  # 從後面找
+                    clean = text.replace(",", "").replace("元", "").strip()
+                    if clean.isdigit() and int(clean) > 10000:
+                        budget = f"NT$ {int(clean):,}"
+                        break
+
+                # 找兩個日期，第二個才是截止投標
+                dates_found = []
+                for text in all_text:
+                    if re.match(r'\d{3}/\d{2}/\d{2}', text):
+                        dates_found.append(text)
+                if len(dates_found) >= 2:
+                    deadline = dates_found[1]  # 第二個日期是截止投標
+                elif len(dates_found) == 1:
+                    deadline = dates_found[0]
+
+                if title and len(title) > 5 and title != "標案名稱":
                     tenders.append({
                         "id":       href.split("pkPmsMain=")[-1] if "pkPmsMain=" in href else title[:20],
                         "title":    title,
                         "unit":     unit,
-                        "budget":   budget + " 元" if budget and budget != "—" else "—",
+                        "budget":   budget,
                         "deadline": deadline,
                         "url":      href or url,
                     })
