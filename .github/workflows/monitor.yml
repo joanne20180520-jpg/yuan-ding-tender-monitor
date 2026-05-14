@@ -23,16 +23,17 @@ jobs:
           python-version: "3.11"
 
       - name: 安裝套件
-        run: pip install requests playwright
+        run: pip install requests playwright gspread google-auth
 
       - name: 安裝 Playwright 瀏覽器
         run: playwright install chromium --with-deps
 
       - name: 執行標案監控
         env:
-          NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
-          GMAIL_USER:   ${{ secrets.GMAIL_USER }}
-          GMAIL_PASS:   ${{ secrets.GMAIL_PASS }}
+          NOTIFY_EMAIL:        ${{ secrets.NOTIFY_EMAIL }}
+          GMAIL_USER:          ${{ secrets.GMAIL_USER }}
+          GMAIL_PASS:          ${{ secrets.GMAIL_PASS }}
+          GOOGLE_CREDENTIALS:  ${{ secrets.GOOGLE_CREDENTIALS }}
         run: python monitor.py
 
       - name: 儲存已通知標案快取
