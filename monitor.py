@@ -1,24 +1,31 @@
 #!/usr/bin/env python3
 """
-monitor.py v7 — Playwright 版（合併 v5 抓取 + v6 欄位解析）
+monitor.py v8 — Playwright + Google Sheets 版
 元頂國際控股集團 — 政府標案即時監控系統
+
+新增功能：自動將符合標案寫入 Google Sheets 資料庫
 """
 
 import os
 import json
 import smtplib
 import asyncio
+import re
 from datetime import datetime, date, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 from playwright.async_api import async_playwright
+import gspread
+from google.oauth2.service_account import Credentials
 from keywords import KEYWORD_GROUPS, ALL_KEYWORDS
 
-SEEN_FILE    = "seen_tenders.json"
-NOTIFY_EMAIL = os.environ.get("NOTIFY_EMAIL", "")
-GMAIL_USER   = os.environ.get("GMAIL_USER", "")
-GMAIL_PASS   = os.environ.get("GMAIL_PASS", "")
+SEEN_FILE      = "seen_tenders.json"
+NOTIFY_EMAIL   = os.environ.get("NOTIFY_EMAIL", "")
+GMAIL_USER     = os.environ.get("GMAIL_USER", "")
+GMAIL_PASS     = os.environ.get("GMAIL_PASS", "")
+GOOGLE_CREDS   = os.environ.get("GOOGLE_CREDENTIALS", "")
+SPREADSHEET_ID = "1TDY5udixPrQ2dQrN2VKUuxnFQ81sdyn9zfsxNUnelW8"
 
 SEARCH_KEYWORDS = [
     "室內裝修", "裝潢", "展館設計", "裝潢施工",
@@ -27,6 +34,55 @@ SEARCH_KEYWORDS = [
     "食品推廣", "農產品推廣",
     "營造工程", "修繕工程",
 ]
+
+
+def get_sheets_client():
+    """建立 Google Sheets 連線"""
+    try:
+        creds_dict = json.loads(GOOGLE_CREDS)
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds  = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+        client = gspread.authorize(creds)
+        return client
+    except Exception as e:
+        print(f"[ERROR] Google Sheets 連線失敗：{e}")
+        return None
+
+
+def write_to_sheets(matches: list[dict]):
+    """將符合標案寫入 Google Sheets"""
+    client = get_sheets_client()
+    if not client:
+        return
+
+    try:
+        sheet = client.open_by_key(SPREADSHEET_ID).sheet1
+        today = datetime.now().strftime("%Y/%m/%d %H:%M")
+
+        rows = []
+        for item in matches:
+            t        = item["tender"]
+            groups   = "、".join(item["classified"].keys()) if item["classified"] else "其他"
+            keywords = "、".join(item["hits"])
+            rows.append([
+                today,
+                t.get("title", ""),
+                t.get("unit", ""),
+                t.get("budget", ""),
+                t.get("deadline", ""),
+                groups,
+                keywords,
+                t.get("url", ""),
+            ])
+
+        sheet.append_rows(rows)
+        print(f"[INFO] ✅ 已將 {len(rows)} 筆標案寫入 Google Sheets")
+
+    except Exception as e:
+        print(f"[ERROR] 寫入 Google Sheets 失敗：{e}")
 
 
 async def search_tenders(keyword: str, page) -> list[dict]:
@@ -49,12 +105,10 @@ async def search_tenders(keyword: str, page) -> list[dict]:
         await page.goto(url, wait_until="networkidle", timeout=30000)
         await page.wait_for_timeout(2000)
 
-        # 用 v5 的方式抓所有 tr（不限定 tbody）
         rows = await page.query_selector_all("table tr")
 
         for row in rows:
             try:
-                # 抓連結（標案名稱）
                 link = await row.query_selector("a")
                 if not link:
                     continue
@@ -63,46 +117,25 @@ async def search_tenders(keyword: str, page) -> list[dict]:
                 if href and not href.startswith("http"):
                     href = "https://web.pcc.gov.tw" + href
 
-                # 抓所有 td
                 cells = await row.query_selector_all("td")
                 if len(cells) < 3:
                     continue
 
-                # 機關名稱（第一欄）
-                unit = (await cells[0].inner_text()).strip()
-
-                # 從所有欄位的文字找日期和金額
+                unit     = (await cells[0].inner_text()).strip()
                 all_text = [(await c.inner_text()).strip() for c in cells]
 
-                # 找截止日期（格式像 115/05/13）
-                import re
-                deadline = "—"
-                budget   = "—"
-                for text in all_text:
-                    if re.match(r'\d{3}/\d{2}/\d{2}', text) and deadline == "—":
-                        # 跳過公告日期（找第二個日期格式）
-                        if deadline != "—":
-                            deadline = text
-                        else:
-                            # 先存起來，後面的才是截止日
-                            deadline = text
-
-                # 找金額（純數字且大於 10000）
-                for text in reversed(all_text):  # 從後面找
-                    clean = text.replace(",", "").replace("元", "").strip()
-                    if clean.isdigit() and int(clean) > 10000:
-                        budget = f"NT$ {int(clean):,}"
-                        break
-
-                # 找兩個日期，第二個才是截止投標
                 dates_found = []
                 for text in all_text:
                     if re.match(r'\d{3}/\d{2}/\d{2}', text):
                         dates_found.append(text)
-                if len(dates_found) >= 2:
-                    deadline = dates_found[1]  # 第二個日期是截止投標
-                elif len(dates_found) == 1:
-                    deadline = dates_found[0]
+                deadline = dates_found[1] if len(dates_found) >= 2 else (dates_found[0] if dates_found else "—")
+
+                budget = "—"
+                for text in reversed(all_text):
+                    clean = text.replace(",", "").replace("元", "").strip()
+                    if clean.isdigit() and int(clean) > 10000:
+                        budget = f"NT$ {int(clean):,}"
+                        break
 
                 if title and len(title) > 5 and title != "標案名稱":
                     tenders.append({
@@ -235,9 +268,10 @@ def send_email(subject, html_body):
     msg["To"]      = NOTIFY_EMAIL
     msg.attach(MIMEText(html_body, "html", "utf-8"))
     try:
+        recipients = [r.strip() for r in NOTIFY_EMAIL.split(",")]
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(GMAIL_USER, GMAIL_PASS)
-            server.sendmail(GMAIL_USER, NOTIFY_EMAIL, msg.as_string())
+            server.sendmail(GMAIL_USER, recipients, msg.as_string())
         print(f"[INFO] ✅ 通知信已寄出至 {NOTIFY_EMAIL}")
     except Exception as e:
         print(f"[ERROR] 寄信失敗：{e}")
@@ -256,13 +290,16 @@ def run():
             continue
         matches.append({"tender": tender, "hits": hits, "classified": classify_hits(hits)})
         seen.add(tid)
+
     if matches:
-        print(f"[INFO] 發現 {len(matches)} 筆新符合標案，準備寄信")
+        print(f"[INFO] 發現 {len(matches)} 筆新符合標案")
         title_list = "、".join(m["tender"].get("title", "")[:15] for m in matches[:3])
         subject    = f"【元頂標案通知】{len(matches)} 筆新標案 — {title_list}{'...' if len(matches) > 3 else ''}"
         send_email(subject, build_email_html(matches))
+        write_to_sheets(matches)
     else:
         print("[INFO] 無新的符合標案，不發送通知")
+
     save_seen(seen)
 
 
