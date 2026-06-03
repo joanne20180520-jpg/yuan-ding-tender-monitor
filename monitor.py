@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-monitor.py v8 — Playwright + Google Sheets 版
+monitor.py v9 — Playwright + Google Sheets + Lark 版
 元頂國際控股集團 — 政府標案即時監控系統
 
-新增功能：自動將符合標案寫入 Google Sheets 資料庫
+新增功能：自動將符合標案推播至 Lark 群組
 """
 
 import os
@@ -11,6 +11,7 @@ import json
 import smtplib
 import asyncio
 import re
+import requests
 from datetime import datetime, date, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -20,12 +21,13 @@ import gspread
 from google.oauth2.service_account import Credentials
 from keywords import KEYWORD_GROUPS, ALL_KEYWORDS
 
-SEEN_FILE      = "seen_tenders.json"
-NOTIFY_EMAIL   = os.environ.get("NOTIFY_EMAIL", "")
-GMAIL_USER     = os.environ.get("GMAIL_USER", "")
-GMAIL_PASS     = os.environ.get("GMAIL_PASS", "")
-GOOGLE_CREDS   = os.environ.get("GOOGLE_CREDENTIALS", "")
-SPREADSHEET_ID = "1TDY5udixPrQ2dQrN2VKUuxnFQ81sdyn9zfsxNUnelW8"
+SEEN_FILE        = "seen_tenders.json"
+NOTIFY_EMAIL     = os.environ.get("NOTIFY_EMAIL", "")
+GMAIL_USER       = os.environ.get("GMAIL_USER", "")
+GMAIL_PASS       = os.environ.get("GMAIL_PASS", "")
+GOOGLE_CREDS     = os.environ.get("GOOGLE_CREDENTIALS", "")
+SPREADSHEET_ID   = "1TDY5udixPrQ2dQrN2VKUuxnFQ81sdyn9zfsxNUnelW8"
+LARK_WEBHOOK_URL = os.environ.get("LARK_WEBHOOK_URL", "")
 
 SEARCH_KEYWORDS = [
     "室內裝修", "裝潢", "展館設計", "裝潢施工",
@@ -277,6 +279,33 @@ def send_email(subject, html_body):
         print(f"[ERROR] 寄信失敗：{e}")
 
 
+def notify_lark(matches):
+    if not LARK_WEBHOOK_URL:
+        print("[WARN] 未設定 LARK_WEBHOOK_URL")
+        return
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    text = f"🔔 元頂標案通知｜{now}\n共 {len(matches)} 筆新標案\n\n"
+
+    for item in matches:
+        t      = item["tender"]
+        groups = "、".join(item["classified"].keys()) if item["classified"] else "其他"
+        text += f"📌 {t.get('title', '')}\n"
+        text += f"🏢 {t.get('unit', '')}\n"
+        text += f"💰 {t.get('budget', '—')}\n"
+        text += f"📅 截止：{t.get('deadline', '—')}\n"
+        text += f"🏷️ {groups}\n\n"
+
+    try:
+        requests.post(LARK_WEBHOOK_URL, json={
+            "msg_type": "text",
+            "content": {"text": text}
+        })
+        print(f"[INFO] ✅ Lark 通知已發送")
+    except Exception as e:
+        print(f"[ERROR] Lark 通知失敗：{e}")
+
+
 def run():
     tenders = asyncio.run(fetch_all_tenders())
     seen    = load_seen()
@@ -296,6 +325,7 @@ def run():
         title_list = "、".join(m["tender"].get("title", "")[:15] for m in matches[:3])
         subject    = f"【元頂標案通知】{len(matches)} 筆新標案 — {title_list}{'...' if len(matches) > 3 else ''}"
         send_email(subject, build_email_html(matches))
+        notify_lark(matches)
         write_to_sheets(matches)
     else:
         print("[INFO] 無新的符合標案，不發送通知")
