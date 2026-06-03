@@ -34,6 +34,7 @@ jobs:
           GMAIL_USER:          ${{ secrets.GMAIL_USER }}
           GMAIL_PASS:          ${{ secrets.GMAIL_PASS }}
           GOOGLE_CREDENTIALS:  ${{ secrets.GOOGLE_CREDENTIALS }}
+          LARK_WEBHOOK_URL:    ${{ secrets.LARK_WEBHOOK_URL }}
         run: python monitor.py
 
       - name: 儲存已通知標案快取
