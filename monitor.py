@@ -285,23 +285,81 @@ def notify_lark(matches):
         return
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    text = f"🔔 元頂標案通知｜{now}\n共 {len(matches)} 筆新標案\n\n"
-
+    
+    elements = []
     for item in matches:
         t      = item["tender"]
         groups = "、".join(item["classified"].keys()) if item["classified"] else "其他"
-        text += f"📌 {t.get('title', '')}\n"
-        text += f"🏢 {t.get('unit', '')}\n"
-        text += f"💰 {t.get('budget', '—')}\n"
-        text += f"📅 截止：{t.get('deadline', '—')}\n"
-        text += f"🏷️ {groups}\n\n"
+        url    = t.get("url", "")
+        
+        elements.append({
+            "tag": "div",
+            "fields": [
+                {
+                    "is_short": True,
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**📌 標案名稱**\n{t.get('title', '')}"
+                    }
+                },
+                {
+                    "is_short": True,
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**🏢 機關**\n{t.get('unit', '')}"
+                    }
+                }
+            ]
+        })
+        elements.append({
+            "tag": "div",
+            "fields": [
+                {
+                    "is_short": True,
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**💰 預算**\n{t.get('budget', '—')}"
+                    }
+                },
+                {
+                    "is_short": True,
+                    "text": {
+                        "tag": "lark_md",
+                        "content": f"**📅 截止**\n{t.get('deadline', '—')}"
+                    }
+                }
+            ]
+        })
+        elements.append({
+            "tag": "action",
+            "actions": [
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "查看詳情"},
+                    "type": "primary",
+                    "url": url
+                }
+            ]
+        })
+        elements.append({"tag": "hr"})
+
+    card = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {
+                    "tag": "plain_text",
+                    "content": f"🔔 元頂標案通知｜發現 {len(matches)} 筆新標案"
+                },
+                "template": "blue"
+            },
+            "elements": elements
+        }
+    }
 
     try:
-        requests.post(LARK_WEBHOOK_URL, json={
-            "msg_type": "text",
-            "content": {"text": text}
-        })
-        print(f"[INFO] ✅ Lark 通知已發送")
+        requests.post(LARK_WEBHOOK_URL, json=card)
+        print(f"[INFO] ✅ Lark 卡片通知已發送")
     except Exception as e:
         print(f"[ERROR] Lark 通知失敗：{e}")
 
